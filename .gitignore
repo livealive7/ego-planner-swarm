@@ -7,3 +7,6 @@ src/CMakeLists.txt
 benchmark_haha.zip
 rebound_planner_BB.zip
 
+install/
+*.log
+*.pyc
