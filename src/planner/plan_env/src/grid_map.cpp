@@ -240,6 +240,19 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
   if (occ != 1 && occ != 0)
     return INVALID_IDX;
 
+  // pos comes from raycasting against a raw depth reading (projectDepthImage /
+  // the raycastProcess loop below), which can be well outside the map for a
+  // garbage pixel (e.g. inf/NaN from a simulated depth camera's "no return"
+  // pixels). Every caller already guards on `vox_idx != INVALID_IDX` before
+  // indexing flag_rayend_/flag_traverse_ with the returned value, but this
+  // function itself never actually returned INVALID_IDX for an out-of-range
+  // pos -- toAddress(id) computed a flat index unconditionally, and indexing
+  // count_hit_and_miss_/count_hit_ (both sized to the in-map voxel count)
+  // with it was straight out-of-bounds vector access, segfaulting
+  // GridMap::raycastProcess within seconds of ego_planner_node starting.
+  if (!isInMap(pos))
+    return INVALID_IDX;
+
   Eigen::Vector3i id;
   posToIndex(pos, id);
   int idx_ctns = toAddress(id);

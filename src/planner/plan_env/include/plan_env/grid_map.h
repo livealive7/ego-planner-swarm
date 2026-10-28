@@ -418,31 +418,21 @@ inline void GridMap::indexToPos(const Eigen::Vector3i &id, Eigen::Vector3d &pos)
 
 inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts)
 {
-  int num = 0;
-  /* ---------- + shape inflate ---------- */
-  // for (int x = -step; x <= step; ++x)
-  // {
-  //   if (x == 0)
-  //     continue;
-  //   pts[num++] = Eigen::Vector3i(pt(0) + x, pt(1), pt(2));
-  // }
-  // for (int y = -step; y <= step; ++y)
-  // {
-  //   if (y == 0)
-  //     continue;
-  //   pts[num++] = Eigen::Vector3i(pt(0), pt(1) + y, pt(2));
-  // }
-  // for (int z = -1; z <= 1; ++z)
-  // {
-  //   pts[num++] = Eigen::Vector3i(pt(0), pt(1), pt(2) + z);
-  // }
-
-  /* ---------- all inflate ---------- */
+  /* ---------- spherical (Euclidean) inflate ----------
+   * The old cube inflate ([-step,step]^3 unconditionally) over-inflates
+   * near obstacle edges/corners/isolated points by up to sqrt(3)x the
+   * intended radius (flat wall interiors are unaffected -- neighboring
+   * voxels' cubes fill in the corners there -- but a shelf corner, a
+   * pillar, or a box edge exposes the excess). Only keep offsets within
+   * Euclidean distance `step` (in grid cells) of the source voxel. */
+  pts.clear();
+  int step2 = step * step;
   for (int x = -step; x <= step; ++x)
     for (int y = -step; y <= step; ++y)
       for (int z = -step; z <= step; ++z)
       {
-        pts[num++] = Eigen::Vector3i(pt(0) + x, pt(1) + y, pt(2) + z);
+        if (x * x + y * y + z * z <= step2)
+          pts.emplace_back(pt(0) + x, pt(1) + y, pt(2) + z);
       }
 }
 
