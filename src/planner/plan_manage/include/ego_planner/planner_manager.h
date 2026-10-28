@@ -58,11 +58,17 @@ namespace ego_planner
     /* main planning algorithms & modules */
     PlanningVisualization::Ptr visualization_;
 
-    // ros::Publisher obj_pub_; //zx-todo 
+    // ros::Publisher obj_pub_; //zx-todo
 
     BsplineOptimizer::Ptr bspline_optimizer_;
 
     int continous_failures_count_{0};
+
+    // Stashed by initPlanModules(). Used (via node_->now()) for every timestamp that later
+    // gets subtracted from a trajectory's start_time_ to get "how far along the trajectory
+    // are we" (t_cur) -- must be a node-attached clock, not a bare rclcpp::Clock(), so it
+    // respects use_sim_time (see updateTrajInfo() and reboundReplan()'s t_cur).
+    rclcpp::Node::SharedPtr node_;
 
     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);
 

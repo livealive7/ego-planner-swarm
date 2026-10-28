@@ -273,16 +273,15 @@ namespace ego_planner
       return;
 
     // if (abs((ros::Time::now() - msg->start_time).toSec()) > 0.25)
-    rclcpp::Clock clock(RCL_SYSTEM_TIME);  // 确保使用当前节点的时间源
-    auto msg_time = rclcpp::Time(msg->start_time, clock.get_clock_type());
-    // RCLCPP_INFO(node_->get_logger(), "Clock type: %d", rclcpp::Clock().now().get_clock_type());
-    // RCLCPP_INFO(node_->get_logger(), "Start time clock type: %d", rclcpp::Time(msg->start_time).get_clock_type());
-    // RCLCPP_INFO(node_->get_logger(), "msg_time: %d", msg_time.get_clock_type());
-    if (abs((rclcpp::Clock().now() - msg_time).seconds()) > 0.25)
+    // msg->start_time is local_data_.start_time_ from the sending drone's planner (a
+    // node_->now() reading, so RCL_ROS_TIME/sim-time domain if use_sim_time is set there
+    // too) -- compare it against our own node_->now(), not an unattached system clock.
+    auto msg_time = rclcpp::Time(msg->start_time, node_->now().get_clock_type());
+    if (abs((node_->now() - msg_time).seconds()) > 0.25)
     {
       // ROS_ERROR("Time difference is too large! Local - Remote Agent %d = %fs", msg->drone_id, (ros::Time::now() - msg->start_time).toSec());
       RCLCPP_ERROR(node_->get_logger(), "Time difference is too large! Local - Remote Agent %d = %fs",
-                   msg->drone_id, (rclcpp::Clock().now() - msg_time).seconds());
+                   msg->drone_id, (node_->now() - msg_time).seconds());
       return;
     }
 
@@ -565,7 +564,7 @@ namespace ego_planner
     {
       /* determine if need to replan */
       LocalTrajData *info = &planner_manager_->local_data_;
-      rclcpp::Time time_now = rclcpp::Clock().now();
+      rclcpp::Time time_now = node_->now();
       double t_cur = (time_now - info->start_time_).seconds();
       t_cur = std::min(info->duration_, t_cur);
 
@@ -626,7 +625,7 @@ namespace ego_planner
     }
     }
 
-    data_disp_.header.stamp = rclcpp::Clock().now();
+    data_disp_.header.stamp = node_->now();
     data_disp_pub_->publish(data_disp_);
 
   force_return:;
@@ -665,7 +664,7 @@ namespace ego_planner
 
     LocalTrajData *info = &planner_manager_->local_data_;
     // ros::Time time_now = ros::Time::now();
-    auto time_now = rclcpp::Clock().now();
+    auto time_now = node_->now();
     // double t_cur = (time_now - info->start_time_).toSec();
     double t_cur = (time_now - info->start_time_).seconds();
 
@@ -717,12 +716,12 @@ namespace ego_planner
     /* ---------- check trajectory ---------- */
     constexpr double time_step = 0.01;
     // double t_cur = (ros::Time::now() - info->start_time_).toSec();
-    double t_cur = (rclcpp::Clock().now() - info->start_time_).seconds();
+    double t_cur = (node_->now() - info->start_time_).seconds();
 
     Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
     const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
     // double t_cur_global = ros::Time::now().toSec();
-    double t_cur_global = rclcpp::Clock().now().seconds();
+    double t_cur_global = node_->now().seconds();
 
     double t_2_3 = info->duration_ * 2 / 3;
     for (double t = t_cur; t < info->duration_; t += time_step)

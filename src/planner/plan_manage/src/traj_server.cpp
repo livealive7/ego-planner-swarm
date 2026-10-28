@@ -8,6 +8,12 @@
 
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
 
+// Stashed by main() so cmdCallback (a free function, not a Node method) can read a
+// clock that's actually attached to this node's TimeSource and therefore respects
+// use_sim_time. See the warning in rclcpp/clock.hpp: an unattached rclcpp::Clock(),
+// even one constructed with RCL_ROS_TIME, always runs on system (wall-clock) time.
+rclcpp::Node::SharedPtr g_node;
+
 quadrotor_msgs::msg::PositionCommand cmd;
 double pos_gain[3] = {0, 0, 0};
 double vel_gain[3] = {0, 0, 0};
@@ -79,7 +85,24 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 
   Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_ ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
   double yaw_temp = dir.norm() > 0.1 ? atan2(dir(1), dir(0)) : last_yaw_;
-  double max_yaw_change = YAW_DOT_MAX_PER_SEC * (time_now - time_last).seconds();
+  // (time_now - time_last).seconds() is used below as a division denominator
+  // in every branch. On the very first call after a trajectory is received,
+  // time_last's static initializer (in cmdCallback()) sets it equal to that
+  // same call's time_now, making this delta exactly 0.0 -- and with
+  // use_sim_time, the /clock-driven ROS time can also legitimately repeat
+  // across back-to-back 100Hz timer ticks if it advances in coarser steps
+  // than that. Dividing by 0.0 produces Inf/NaN (0.0/0.0 specifically when
+  // yaw_temp happens to equal last_yaw_, both commonly 0 on that first
+  // call), which propagates through yawdot -> /position_cmd ->
+  // poscmd_to_cmdvel_node's cmd_vel.angular.z -> ArduCopter, where SITL's
+  // feenableexcept build aborts with SIGFPE the instant it reaches any FP
+  // comparison/arithmetic on it. Confirmed: ArduCopter crashed with
+  // "Floating point exception" within seconds of every goal send until this
+  // guard was added.
+  double dt = (time_now - time_last).seconds();
+  if (dt < 1e-3)
+    dt = 1e-3;
+  double max_yaw_change = YAW_DOT_MAX_PER_SEC * dt;
   if (yaw_temp - last_yaw_ > PI)
   {
     if (yaw_temp - last_yaw_ - 2 * PI < -max_yaw_change)
@@ -96,7 +119,7 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
       if (yaw - last_yaw_ > PI)
         yawdot = -YAW_DOT_MAX_PER_SEC;
       else
-        yawdot = (yaw_temp - last_yaw_) / (time_now - time_last).seconds();
+        yawdot = (yaw_temp - last_yaw_) / dt;
     }
   }
   else if (yaw_temp - last_yaw_ < -PI)
@@ -115,7 +138,7 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
       if (yaw - last_yaw_ < -PI)
         yawdot = YAW_DOT_MAX_PER_SEC;
       else
-        yawdot = (yaw_temp - last_yaw_) / (time_now - time_last).seconds();
+        yawdot = (yaw_temp - last_yaw_) / dt;
     }
   }
   else
@@ -144,7 +167,7 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
       else if (yaw - last_yaw_ < -PI)
         yawdot = YAW_DOT_MAX_PER_SEC;
       else
-        yawdot = (yaw_temp - last_yaw_) / (time_now - time_last).seconds();
+        yawdot = (yaw_temp - last_yaw_) / dt;
     }
   }
 
@@ -167,14 +190,13 @@ void cmdCallback()
     return;
 
   // 统一时间源
-  rclcpp::Clock clock(RCL_ROS_TIME);  
-  rclcpp::Time time_now = clock.now();
+  rclcpp::Time time_now = g_node->now();
   double t_cur = (time_now - start_time_).seconds();
 
   Eigen::Vector3d pos(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
   std::pair<double, double> yaw_yawdot(0, 0);
 
-  static rclcpp::Time time_last = clock.now();
+  static rclcpp::Time time_last = time_now;
   if (t_cur < traj_duration_ && t_cur >= 0.0)
   {
     pos = traj_[0].evaluateDeBoorT(t_cur);
@@ -235,6 +257,7 @@ int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("traj_server");
+  g_node = node;
 
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
       "planning/bspline",
