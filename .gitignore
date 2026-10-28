@@ -10,3 +10,4 @@ rebound_planner_BB.zip
 install/
 *.log
 *.pyc
+log/

@@ -145,7 +145,9 @@ def generate_launch_description():
             {'grid_map/local_update_range_x': 5.5},
             {'grid_map/local_update_range_y': 5.5},
             {'grid_map/local_update_range_z': 4.5},
-            {'grid_map/obstacles_inflation': 0.099},
+            # Iris frame: 550mm motor-to-motor wheelbase (radius to motor ~0.275m)
+            # + 10in props (radius 0.127m) => prop-tip radius ~0.4m from center.
+            {'grid_map/obstacles_inflation': 0.4},
             {'grid_map/local_map_margin': 10},
             {'grid_map/ground_height': -0.01},
             # camera parameter
