@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'odom_bridge_node = isaac_odom_bridge.odom_bridge_node:main',
             'cmd_vel_mavlink_bridge = isaac_odom_bridge.cmd_vel_mavlink_bridge:main',
+            'cmd_vel_px4_bridge = isaac_odom_bridge.cmd_vel_px4_bridge:main',
             'depth_restamp_node = isaac_odom_bridge.depth_restamp_node:main',
             'poscmd_to_cmdvel_node = isaac_odom_bridge.poscmd_to_cmdvel_node:main',
         ],

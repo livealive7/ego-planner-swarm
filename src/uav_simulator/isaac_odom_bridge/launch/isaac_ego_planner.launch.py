@@ -14,8 +14,11 @@ Starts, in order:
   2. odom_bridge_node   -- synthesizes nav_msgs/Odometry from Isaac Sim's
                             separate state/pose + state/twist_inertial,
                             published as /drone_<id>_<odometry_topic>.
-  3. cmd_vel_mavlink_bridge -- forwards cmd_vel (Twist, body frame) to the
-                            drone's ArduPilot SITL over MAVLink.
+  3. cmd_vel_mavlink_bridge (backend:=ardupilot, default) or
+     cmd_vel_px4_bridge (backend:=px4) -- forwards cmd_vel (Twist, body
+                            frame) to the drone's ArduPilot or PX4 SITL
+                            over MAVLink. Pick with the 'backend' launch
+                            argument.
   4. depth_restamp_node -- relays Isaac's real depth topic, overwriting
                             header.stamp with this node's own clock.
   5. ego_planner_node   -- the planner + grid_map, wired to the topics
@@ -86,14 +89,27 @@ origin, that part still isn't modeled; publish it on
 /vins_estimator/extrinsic (nav_msgs/Odometry) if it turns out to matter.
 
 cx/cy/fx/fy default to the real intrinsics read from
-/drone0/camera/color/camera_info (fx=fy=457.0073547363281, cx=320.0,
-cy=240.0, 640x480). There is no separate depth camera_info topic; the
-depth image is also 640x480 (confirmed via /drone0/camera/depth), so
+/drone0/camera/color/camera_info (fx=fy=228.50367736816406, cx=160.0,
+cy=120.0, 320x240). There is no separate depth camera_info topic; the
+depth image is also 320x240 (confirmed via /drone0/camera/depth), so
 reusing the color camera's intrinsics assumes both come from the same
 underlying camera prim in Isaac Sim. /drone0/camera/depth's encoding is
 32FC1 (meters), which grid_map converts using k_depth_scaling_factor --
 1000.0 is correct for that. If you add a second drone with a differently
 configured camera, override cx/cy/fx/fy via launch arguments.
+
+320x240 (not 640x480) is deliberate: 12_multi_backend_standalone.py's
+camera used to default to 640x480, and running it that way (vs. the
+pegasus.multi_backend_example *extension*, whose GUI button spawns the
+same drone at 320x240) was measured pinning Isaac Sim's own process at
+~19 CPU cores vs. ~10 at 320x240 on this box -- enough to starve
+ArduCopter's SITL process down to <1% CPU, which in turn starved its
+GPS backend below AP_GPS::is_healthy()'s ~4.65Hz threshold
+(libraries/AP_GPS/AP_GPS.cpp) and blocked arming entirely. Lowering the
+standalone script's own --cam-res default to match closed most but not
+all of that gap; the rest needs the ArduCopter process's own scheduling
+priority raised (needs root - chrt/renice), which this launch file has
+no way to do for you.
 
 Each ArduPilot SITL instance started via sim_vehicle.py listens on
 14550 + 10*instance by default, so mavlink_connection auto-derives from
@@ -117,6 +133,10 @@ def launch_setup(context, *args, **kwargs):
     drone_id = int(drone_id_str)
     namespace = f'drone{drone_id_str}'
 
+    backend = perform_substitutions(context, [LaunchConfiguration('backend')]).strip().lower()
+    if backend not in ('ardupilot', 'px4'):
+        raise ValueError(f"backend must be 'ardupilot' or 'px4', got {backend!r}")
+
     odometry_topic = perform_substitutions(
         context, [LaunchConfiguration('odometry_topic')])
     odom_output_topic = f'/drone_{drone_id_str}_{odometry_topic}'
@@ -127,7 +147,32 @@ def launch_setup(context, *args, **kwargs):
     mavlink_connection = perform_substitutions(
         context, [LaunchConfiguration('mavlink_connection')])
     if not mavlink_connection:
-        mavlink_connection = f'udp:127.0.0.1:{14550 + 10 * drone_id}'
+        if backend == 'ardupilot':
+            # NOT port 14550: Pegasus's own ArduPilotMavlinkBackend hardcodes
+            # udpin:127.0.0.1:14550+10*id as its HIL sensor/actuator channel to
+            # ArduPilot (see ardupilot_mavlink_backend.py's connection_baseport
+            # default). run_ardupilot.sh's own --out is deliberately on 14551
+            # instead, as a dedicated companion-computer link.
+            #
+            # pymavlink's bare 'udp:' prefix defaults to input=True (bind/listen),
+            # not connect-out. Against 14550 that used to make this node silently
+            # re-bind() Pegasus's own HIL socket (SO_REUSEADDR lets a second bind
+            # to the identical address:port succeed with no error), splitting
+            # delivery of Pegasus's HIL feed between the two sockets -- confirmed
+            # by bind()-ing that combination by hand while Pegasus already held
+            # it. That's why arming/hover looked fine (nothing sent on this port
+            # yet) but things broke exactly once cmd_vel started flowing after a
+            # goal. Explicit 'udpout:' makes this node the connecting client to
+            # run_ardupilot.sh's --out=udpin:0.0.0.0:14551 link instead.
+            mavlink_connection = f'udpout:127.0.0.1:{14551 + 10 * drone_id}'
+        else:
+            # PX4 SITL sends its offboard/companion-computer MAVLink stream to
+            # UDP 14540 + 10*instance by default (14550+10*instance is the
+            # separate GCS link) -- see cmd_vel_px4_bridge.py's own default
+            # and PX4MavlinkBackendConfig.connection_baseport (4560, the HIL
+            # sim link, is a different port again). 'udpin:' here because PX4
+            # connects out to us, we don't connect out to it.
+            mavlink_connection = f'udpin:0.0.0.0:{14540 + 10 * drone_id}'
 
     venv_site_packages = perform_substitutions(
         context, [LaunchConfiguration('venv_site_packages')])
@@ -141,11 +186,14 @@ def launch_setup(context, *args, **kwargs):
     # 'world'. Bridge the two with an identity static transform -- they're
     # the same physical origin, just named differently by different Isaac
     # OmniGraph nodes.
+    use_sim_time = LaunchConfiguration('use_sim_time')
+
     world_map_tf_node = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='world_to_map_tf',
         arguments=['0', '0', '0', '0', '0', '0', 'world', 'map'],
+        parameters=[{'use_sim_time': use_sim_time}],
         output='screen',
     )
 
@@ -159,27 +207,48 @@ def launch_setup(context, *args, **kwargs):
             'twist_topic': twist_topic,
             'output_topic': odom_output_topic,
             'world_frame_id': 'world',
+            'use_sim_time': use_sim_time,
         }],
         output='screen',
     )
 
-    cmd_vel_node = Node(
-        package='isaac_odom_bridge',
-        executable='cmd_vel_mavlink_bridge',
-        name='cmd_vel_mavlink_bridge',
-        namespace=namespace,
-        parameters=[{
-            'connection_string': mavlink_connection,
-            'cmd_vel_topic': cmd_vel_topic,
-        }],
-        # cmd_vel_mavlink_bridge imports pymavlink, which only lives in the
-        # ArduPilot venv. colcon-generated console_scripts always shebang
-        # the system python3, which can't see the venv's site-packages, so
-        # inject it directly into this node's process environment instead
-        # of requiring everyone to `export PYTHONPATH=...` by hand.
-        additional_env={'PYTHONPATH': merged_pythonpath},
-        output='screen',
-    )
+    # Both cmd_vel_mavlink_bridge (ArduPilot) and cmd_vel_px4_bridge (PX4)
+    # import pymavlink, which only lives in the ArduPilot venv.
+    # colcon-generated console_scripts always shebang the system python3,
+    # which can't see the venv's site-packages, so inject it directly into
+    # the node's process environment instead of requiring everyone to
+    # `export PYTHONPATH=...` by hand.
+    if backend == 'ardupilot':
+        cmd_vel_node = Node(
+            package='isaac_odom_bridge',
+            executable='cmd_vel_mavlink_bridge',
+            name='cmd_vel_mavlink_bridge',
+            namespace=namespace,
+            parameters=[{
+                'connection_string': mavlink_connection,
+                'cmd_vel_topic': cmd_vel_topic,
+                'use_sim_time': use_sim_time,
+            }],
+            additional_env={'PYTHONPATH': merged_pythonpath},
+            output='screen',
+        )
+    else:
+        cmd_vel_node = Node(
+            package='isaac_odom_bridge',
+            executable='cmd_vel_px4_bridge',
+            name='cmd_vel_px4_bridge',
+            namespace=namespace,
+            parameters=[{
+                'connection_string': mavlink_connection,
+                'cmd_vel_topic': cmd_vel_topic,
+                'takeoff_height': float(perform_substitutions(
+                    context, [LaunchConfiguration('takeoff_height')])),
+                'odom_topic': odom_output_topic,
+                'use_sim_time': use_sim_time,
+            }],
+            additional_env={'PYTHONPATH': merged_pythonpath},
+            output='screen',
+        )
 
     depth_topic_absolute = f'/drone{drone_id_str}/camera/depth'
     depth_restamped_topic = f'/drone{drone_id_str}/camera/depth_restamped'
@@ -192,6 +261,7 @@ def launch_setup(context, *args, **kwargs):
         parameters=[{
             'input_topic': depth_topic_absolute,
             'output_topic': depth_restamped_topic,
+            'use_sim_time': use_sim_time,
         }],
         output='screen',
     )
@@ -211,6 +281,7 @@ def launch_setup(context, *args, **kwargs):
         ],
         parameters=[
             {'traj_server/time_forward': 1.0},
+            {'use_sim_time': use_sim_time},
         ],
     )
 
@@ -228,6 +299,7 @@ def launch_setup(context, *args, **kwargs):
             'position_cmd_topic': '/position_cmd',
             'odom_topic': odom_output_topic,
             'cmd_vel_topic': cmd_vel_topic,
+            'use_sim_time': use_sim_time,
         }],
         output='screen',
     )
@@ -257,7 +329,7 @@ def launch_setup(context, *args, **kwargs):
         ],
         parameters=[
             {'fsm/flight_type': 1},
-            {'fsm/thresh_replan_time': 1.0},
+            {'fsm/thresh_replan_time': 0.5},
             {'fsm/thresh_no_replan_meter': 1.0},
             {'fsm/planning_horizon': LaunchConfiguration('planning_horizon')},
             {'fsm/planning_horizen_time': 3.0},
@@ -274,7 +346,16 @@ def launch_setup(context, *args, **kwargs):
             {'grid_map/local_update_range_x': 5.5},
             {'grid_map/local_update_range_y': 5.5},
             {'grid_map/local_update_range_z': 4.5},
-            {'grid_map/obstacles_inflation': 0.099},
+            # Iris prop-tip radius is ~0.4m, but 0.4-0.5 was confirmed to make
+            # the planner treat the drone's own position as inside an
+            # obstacle in at least one corridor in this map (massive
+            # replan-fail-loop: 133k "First 3 control points in obstacles"
+            # warnings / 76k replan attempts / only 55 successes in one
+            # 150s flight). Also note grid_map.cpp's inf_step = ceil(this /
+            # resolution) rounds UP to whole 0.1m grid cells, so 0.45 and 0.5
+            # were actually identical (both -> 5 cells -> 0.5m) -- to get a
+            # real change, use a value that lands on a different cell count.
+            {'grid_map/obstacles_inflation': 0.5},
             {'grid_map/local_map_margin': 10},
             {'grid_map/ground_height': -0.01},
             # camera parameters -- see the module docstring
@@ -291,11 +372,11 @@ def launch_setup(context, *args, **kwargs):
             {'grid_map/k_depth_scaling_factor': LaunchConfiguration('k_depth_scaling_factor')},
             {'grid_map/skip_pixel': 2},
             # local fusion
-            {'grid_map/p_hit': 0.65},
+            {'grid_map/p_hit': 0.75},
             {'grid_map/p_miss': 0.35},
             {'grid_map/p_min': 0.12},
             {'grid_map/p_max': 0.90},
-            {'grid_map/p_occ': 0.80},
+            {'grid_map/p_occ': 0.70},
             {'grid_map/min_ray_length': 0.1},
             {'grid_map/max_ray_length': 4.5},
 
@@ -336,6 +417,8 @@ def launch_setup(context, *args, **kwargs):
             {'prediction/obj_num': 0},
             {'prediction/lambda': 1.0},
             {'prediction/predict_rate': 1.0},
+
+            {'use_sim_time': use_sim_time},
         ],
     )
 
@@ -358,6 +441,32 @@ def launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('drone_id', default_value='0'),
+
+        DeclareLaunchArgument(
+            'takeoff_height', default_value='2.0',
+            description='px4 backend only: after auto arm + OFFBOARD, climb '
+                        'straight up to this odom z (m) before ego-planner '
+                        'takes over. 0 disables.'),
+        DeclareLaunchArgument(
+            'backend', default_value='ardupilot',
+            description="'ardupilot' or 'px4' -- selects which cmd_vel "
+                        "bridge node (cmd_vel_mavlink_bridge vs "
+                        "cmd_vel_px4_bridge) is launched and the default "
+                        "MAVLink port scheme used when 'mavlink_connection' "
+                        "is left empty."),
+
+        # All nodes below use this instead of wall-clock time, reading it from /clock
+        # (published by Isaac's ROS2Backend when pub_clock is enabled -- see
+        # ros2_backend.py). Needed because the sim's real-time factor can be well
+        # below 1 (heavy rendering, camera sensors): traj_server's t_cur, grid_map's
+        # depth+odom time-sync, and every other now()-based computation in this graph
+        # were previously measured against wall-clock time while the vehicle itself
+        # only advanced at simulation speed, so the planner's replan starting point
+        # ran further and further ahead of where the vehicle actually was -- by several
+        # meters after under a minute of flight -- eventually placing it past obstacles
+        # the vehicle hadn't reached (or even seen) yet. Set to false to fall back to
+        # each node's own wall clock (e.g. if /clock isn't being published).
+        DeclareLaunchArgument('use_sim_time', default_value='true'),
 
         # odom_bridge_node
         DeclareLaunchArgument(
@@ -394,15 +503,17 @@ def generate_launch_description():
         DeclareLaunchArgument('map_size_x_', default_value='42.0'),
         DeclareLaunchArgument('map_size_y_', default_value='82.0'),
         DeclareLaunchArgument('map_size_z_', default_value='10.5'),
-        DeclareLaunchArgument('cx', default_value='320.0',
-                               description='From /drone0/camera/color/camera_info.'),
-        DeclareLaunchArgument('cy', default_value='240.0'),
-        DeclareLaunchArgument('fx', default_value='457.0073547363281'),
-        DeclareLaunchArgument('fy', default_value='457.0073547363281'),
+        DeclareLaunchArgument('cx', default_value='160.0',
+                               description='From /drone0/camera/color/camera_info '
+                                           '(320x240 -- see this file\'s module '
+                                           'docstring for why not 640x480).'),
+        DeclareLaunchArgument('cy', default_value='120.0'),
+        DeclareLaunchArgument('fx', default_value='228.50367736816406'),
+        DeclareLaunchArgument('fy', default_value='228.50367736816406'),
         DeclareLaunchArgument('k_depth_scaling_factor', default_value='1000.0'),
-        DeclareLaunchArgument('max_vel', default_value='0.5'),
-        DeclareLaunchArgument('max_acc', default_value='0.8'),
-        DeclareLaunchArgument('planning_horizon', default_value='5.0'),
+        DeclareLaunchArgument('max_vel', default_value='1.0'),
+        DeclareLaunchArgument('max_acc', default_value='2.0'),
+        DeclareLaunchArgument('planning_horizon', default_value='7.5'),
 
         # foxglove_bridge
         DeclareLaunchArgument(
